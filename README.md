@@ -50,6 +50,8 @@ Your next focus and listening sessions for each plan. Set time slots and get not
 <br clear="right">
 
 ### Reader
+<img src="docs/screenshots/reader.png" width="180" align="right" alt="Reader">
+
 A pdf.js reader that opens where you left off. Highlight, add notes, or mark a passage as **Confused**. Reading time is logged per document.
 
 <br clear="right">
