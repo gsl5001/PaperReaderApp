@@ -1,7 +1,5 @@
 # PaperReaderApp
 
-<hr>
-
 I found that I have lots of pockets of free time between activities where I could be reading or learning a small amount. I wanted a system which is low friction (works on my phone) and integrates with my agents so I can easily define a syllabus based on my weak points. The agents will take into account the things you've marked as 'confusing' and alter their quiz questions around these. 
 
 I use Claude to generate the reading plan and then I use an API key to use smaller cheaper models for the question generation. I might experiment with how much context/model capacity is required for good questions in the future. 
