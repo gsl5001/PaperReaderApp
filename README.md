@@ -1,66 +1,114 @@
 # PaperReaderApp
 
-An Android app for working through a reading plan of textbooks and papers. You import a plan file, read the PDFs in the app, mark passages you find confusing, and take quizzes on each section. Built with Expo and React Native.
+**Read papers on a plan, mark what confuses you, get quizzed until it sticks.**
 
-## What it does
+An Android app for working through textbooks and papers section by section. Import a reading plan, read the PDFs in the app, and take a quiz at the end of each section. Passages you mark as confusing come back as explanations and questions.
 
-- **Plans**: import a `plan/v1` file (YAML frontmatter plus markdown sections) listing the documents, the reading for each section with page ranges, and quiz questions. Several plans can run at once. See `plans/counterfactual-models.plan.md` for an example and `skills/learning-plan-writer/references/format.md` for the format.
-- **Today**: the next reading and listening sessions for each plan, with notifications at scheduled slots (Start, Snooze, Skip). Plans without slots just list the next items.
-- **Reader**: PDF viewer (pdf.js in a WebView) that resumes where you left off. Highlight, add notes, or mark a passage as Confused. Reading time is logged per document.
-- **Quizzes**: one per section, unlocked when its reading is done. Multiple choice or self-graded open questions. Missed questions come back in the next section's quiz and in reviews 7 days later until answered correctly twice.
-- **Confusion loop**: export your confused passages, have an explanation and questions written for them (by hand, with Claude, or through the optional model integration below), and import the result as a `questions/v1` file. The questions are added to your next quiz.
-- **Marks** tab: all highlights, notes and confusions, filterable by document and status.
-- **Progress**: sections done, confusions, reading time, and a markdown export per plan.
+<p align="center">
+  <img src="docs/screenshots/today.png" width="200" alt="Today">
+  <img src="docs/screenshots/plan.png" width="200" alt="Plan">
+  <img src="docs/screenshots/reader.png" width="200" alt="Reader">
+  <img src="docs/screenshots/quiz.png" width="200" alt="Quiz">
+</p>
 
-## Optional model integration
+## How it works
 
-With an API key for an OpenAI-compatible chat completions endpoint, the app can:
+```mermaid
+flowchart TD
+    A[Goal or reading list] -->|learning-plan-writer skill| B[plan/v1 file]
+    B -->|Import| C[Plan: sections, readings, questions]
+    C --> D[Today: next sessions and reminders]
+    D --> E[Reader]
+    E -->|Highlight / note| M[Marks]
+    E -->|Mark as Confused| F{API key set?}
+    F -->|Yes| G[Model writes explanation and 2-3 questions]
+    F -->|No| H[Export confusions, get questions/v1 file, import]
+    G --> Q
+    H --> Q
+    E -->|Section reading done| S[Section quiz unlocks<br>+ 3 model-written extra questions]
+    S --> Q[Quiz]
+    Q -->|Got it twice| R[Retired]
+    Q -->|Missed or Partly| V[Reworded variant]
+    V -->|Next section's quiz, then review in 7 days| Q
+    Q -->|Quiz done| N[Next section]
+    N --> D
+    C --> P[Progress export]
+```
 
-- reword a question after you get it wrong, so the retry tests understanding rather than memory;
-- explain a passage marked Confused and write 2–3 questions about it;
-- write 3 extra questions for a section from the text of its pages.
+## Features
 
-Enter the key, endpoint, model and prices in **Settings**. The key is stored on the phone with `expo-secure-store` and is never part of the app bundle. Each request is logged with an estimated cost, and a notification is sent each time the total passes another £5. Without a key, everything works through the manual export and import.
+### Plans
+<img src="docs/screenshots/plans.png" width="180" align="right" alt="Plans">
+
+Import a `plan/v1` markdown file listing the documents, each section's reading with page ranges, and quiz questions. Run several plans at once. Each plan shows what you're reading, what's due and what's done, with progress and reading time per section.
+
+<br clear="right">
+
+### Today
+<img src="docs/screenshots/today.png" width="180" align="right" alt="Today">
+
+Your next focus and listening sessions for each plan. Set time slots and get notifications with Start, Snooze and Skip. Missed sessions roll forward instead of piling up. No slots? It just lists what's next.
+
+<br clear="right">
+
+### Reader
+<img src="docs/screenshots/reader.png" width="180" align="right" alt="Reader">
+
+A pdf.js reader that opens where you left off. Highlight, add notes, or mark a passage as **Confused**. Reading time is logged per document.
+
+<br clear="right">
+
+### Quizzes
+<img src="docs/screenshots/quiz.png" width="180" align="right" alt="Quiz">
+
+Each section's quiz unlocks when its reading is done. Questions are multiple choice or open with self-grading, and each answer links to its page. Wrong answers come back in the next section's quiz and again a week later until you get them right twice.
+
+<br clear="right">
+
+### Confusions
+<img src="docs/screenshots/marks.png" width="180" align="right" alt="Marks">
+
+Every confused passage gets an explanation and a few questions, which go to the front of your next quiz. When you've answered them all correctly twice, the confusion is resolved. The **Marks** tab lists all highlights, notes and confusions, filtered by document and status.
+
+<br clear="right">
+
+### Optional model integration
+
+Add a key for an OpenAI-compatible endpoint in **Settings** and the app will:
+
+- explain confused passages and write questions about them;
+- write 3 extra questions per section from the pages you read;
+- reword questions you got wrong, so the retry tests understanding rather than memory.
+
+The key stays on the phone (`expo-secure-store`), every request is logged with an estimated cost, and you get a notification every £5. Without a key, the same loop runs through markdown export and import.
 
 ## Writing plans with Claude
 
-`skills/learning-plan-writer` is a Claude skill that writes `plan/v1` files: give it a goal or an existing reading list and it produces an importable plan with real PDF page ranges and quiz questions. `skills/learning-plan-writer/evals` holds its test cases.
+[`skills/learning-plan-writer`](skills/learning-plan-writer) is a Claude skill that turns a goal or reading list into an importable plan, with real PDF page ranges and quiz questions. Example output: [`plans/counterfactual-models.plan.md`](plans/counterfactual-models.plan.md).
 
 ## Development
 
 ```bash
 npm install
-npm run build:viewer   # rebuilds src/lib/reader/pdf-viewer-html.generated.ts after changes to the viewer
+npx jest               # tests
 npx tsc --noEmit       # typecheck
 npx expo lint          # lint
-npx jest               # tests
+npm run build:viewer   # rebuild the PDF viewer after editing src/lib/reader
 ```
 
-The generated viewer file is committed, so a fresh clone builds without running `build:viewer`.
+The built viewer is committed, so a fresh clone runs without `build:viewer`.
 
-## Building and shipping
+### Build and ship
 
-Builds and updates go through [EAS](https://docs.expo.dev/eas/). To use your own Expo account, change `owner` and `extra.eas.projectId` in `app.json` (or run `npx eas-cli init`).
+Uses [EAS](https://docs.expo.dev/eas/). For your own Expo account, change `owner` and `extra.eas.projectId` in `app.json` or run `npx eas-cli init`.
 
 ```bash
-# Install build (APK), needed once and again whenever native modules change
-npx eas-cli build --platform android --profile preview
-
-# Ship JavaScript changes to installed apps
-npx eas-cli update --branch preview --environment preview --message "..."
+npx eas-cli build --platform android --profile preview   # APK, only when native modules change
+npx eas-cli update --branch preview --environment preview --message "..."   # JS updates
 ```
 
-In the app, **Settings → Check for update** fetches the latest update.
-
-## Layout
-
-- `src/app`: screens (expo-router)
-- `src/lib`: plan parsing, database (expo-sqlite), scheduling, quizzes, marks, confusions, model requests
-- `src/lib/reader`: the pdf.js viewer that runs in the WebView
-- `scripts/build-pdf-viewer.mjs`: bundles the viewer
-- `plans`: example plan
-- `skills/learning-plan-writer`: Claude skill for writing plans
+Installed apps pick up updates from **Settings → Check for update**.
 
 ## Licence
 
-MIT. See `LICENSE`.
+MIT
