@@ -5,10 +5,10 @@
 An Android app for working through textbooks and papers section by section. Import a reading plan, read the PDFs in the app, and take a quiz at the end of each section. Passages you mark as confusing come back as explanations and questions.
 
 <p align="center">
-  <img src="docs/screenshots/today.png" width="200" alt="Today">
+  <img src="docs/screenshots/plans.png" width="200" alt="Plans">
   <img src="docs/screenshots/plan.png" width="200" alt="Plan">
-  <img src="docs/screenshots/reader.png" width="200" alt="Reader">
   <img src="docs/screenshots/quiz.png" width="200" alt="Quiz">
+  <img src="docs/screenshots/marks.png" width="200" alt="Marks">
 </p>
 
 ## How it works
@@ -38,22 +38,18 @@ flowchart TD
 ## Features
 
 ### Plans
-<img src="docs/screenshots/plans.png" width="180" align="right" alt="Plans">
+<img src="docs/screenshots/plan.png" width="180" align="right" alt="Plan">
 
 Import a `plan/v1` markdown file listing the documents, each section's reading with page ranges, and quiz questions. Run several plans at once. Each plan shows what you're reading, what's due and what's done, with progress and reading time per section.
 
 <br clear="right">
 
 ### Today
-<img src="docs/screenshots/today.png" width="180" align="right" alt="Today">
-
 Your next focus and listening sessions for each plan. Set time slots and get notifications with Start, Snooze and Skip. Missed sessions roll forward instead of piling up. No slots? It just lists what's next.
 
 <br clear="right">
 
 ### Reader
-<img src="docs/screenshots/reader.png" width="180" align="right" alt="Reader">
-
 A pdf.js reader that opens where you left off. Highlight, add notes, or mark a passage as **Confused**. Reading time is logged per document.
 
 <br clear="right">
