@@ -1,0 +1,7 @@
+schema_version: "1.1"
+name: book-plus-papers
+expected_outcome: |
+  A single plan/v1 file that the parser accepts, with no slots, start
+  2026-11-23, about 2 sections, the Bishop book listed with no URL and
+  page-less references, the DDPM paper with a pinned arXiv PDF URL and real
+  page ranges, and questions with answers and concepts.

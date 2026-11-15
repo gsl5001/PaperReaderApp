@@ -1,0 +1,489 @@
+<!doctype html>
+<!--
+  PDF viewer that runs inside react-native-webview: a continuous vertical scroll
+  of pages. Every page has a placeholder at its size; only pages near the screen
+  are drawn, and pages far away are cleared to save memory.
+
+  Pinch zoom is the WebView's own (up to 5x). After a pinch settles, drawn pages near the
+  screen are redrawn at a resolution matching the zoom, capped at MAX_CANVAS_PIXELS each.
+
+  scripts/build-pdf-viewer.mjs inlines pdf.js into this file and writes
+  src/lib/reader/pdf-viewer-html.generated.ts. Edit this file, not the generated one.
+
+  Messages from React Native (document 'message' event, string data):
+    LOAD:<base64>   open a PDF
+    PAGE:<n>        scroll to the top of page n
+    GOTO:<n>:<f>    scroll so fraction f (0–1) of page n is above the top of the screen
+    MARKS:<json>    set the marks to draw: [{id, kind, rects:[{page,x,y,w,h}]}]
+    CLEARSEL        clear the text selection
+    TEXT:<id>:<a>:<b>   extract the plain text of pages a..b
+  Messages to React Native (JSON via window.ReactNativeWebView.postMessage):
+    {type:'ready'}
+    {type:'received', at, chars}
+    {type:'loaded', numPages, decodeMs, openMs}
+    {type:'rendered', page, renderMs, textMs, textItems}
+    {type:'position', page, offset}          page at the top of the screen; offset = fraction of it scrolled past (0–1)
+    {type:'selection', text, pageStart, pageEnd, rects:[{page,x,y,w,h}]}   x,y,w,h = fractions of that page
+    {type:'markTap', id}                     a tap landed on a drawn mark
+    {type:'text', id, pages:[{page, text}], error?}   reply to TEXT
+    {type:'error', message}
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=5, user-scalable=yes">
+<style>
+  html, body { margin: 0; padding: 0; background: #888; }
+  #pages { padding: 8px 0; }
+  .page { position: relative; margin: 0 auto 8px; background: white; overflow: hidden; }
+  .page canvas { display: block; position: absolute; top: 0; left: 0; }
+  /* Marks sit between the canvas and the (transparent) text layer, so text stays selectable. */
+  .marks { position: absolute; inset: 0; pointer-events: none; mix-blend-mode: multiply; }
+  .mark { position: absolute; border-radius: 2px; }
+  .mark.highlight { background: rgba(255, 214, 0, 0.45); }
+  .mark.confused { background: rgba(255, 90, 90, 0.40); }
+  .mark.note { background: rgba(80, 160, 255, 0.40); }
+  /*__TEXT_LAYER_CSS__*/
+</style>
+</head>
+<body>
+<div id="pages"></div>
+<script>
+(function () {
+  const LIB_SRC = /*__PDF_LIB__*/'';
+  const WORKER_SRC = /*__PDF_WORKER__*/'';
+
+  // Draw pages within this distance of the screen; clear pages further than CLEAR_MARGIN.
+  const DRAW_MARGIN = '150% 0px';
+  const CLEAR_MARGIN = '400% 0px';
+  const MAX_CONCURRENT_RENDERS = 2;
+  // Largest canvas per page, in device pixels (about 64 MB of memory at 4 bytes a pixel).
+  const MAX_CANVAS_PIXELS = 16e6;
+  let zoom = 1;
+
+  // Canvas pixels per CSS pixel for a page: device pixel ratio times zoom, within the cap.
+  function quality(p) {
+    const q = (window.devicePixelRatio || 1) * Math.max(1, zoom);
+    const cap = Math.sqrt(MAX_CANVAS_PIXELS / (p.width * p.height));
+    return Math.min(q, cap);
+  }
+
+  function makeCanvas(p, q) {
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.floor(p.width * q);
+    canvas.height = Math.floor(p.height * q);
+    canvas.style.width = p.width + 'px';
+    canvas.style.height = p.height + 'px';
+    return canvas;
+  }
+
+  const send = (msg) => window.ReactNativeWebView.postMessage(JSON.stringify(msg));
+  const sendError = (err) => send({ type: 'error', message: String((err && err.stack) || err) });
+  window.onerror = (message, source, line) => send({ type: 'error', message: `${message} (line ${line})` });
+  window.onunhandledrejection = (e) => sendError(e.reason);
+
+  const blobUrl = (src) => URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+  const pagesDiv = document.getElementById('pages');
+
+  let pdfjs = null;
+  let doc = null;
+  /** Per page (index = page number - 1): { div, width, height, state: 'empty'|'queued'|'drawing'|'drawn', task, textLayer } */
+  let pages = [];
+  let drawObserver = null;
+  /** Marks to draw: [{id, kind, rects:[{page,x,y,w,h}]}] */
+  let marks = [];
+  let clearObserver = null;
+  const queue = [];
+  let active = 0;
+
+  async function init() {
+    pdfjs = await import(blobUrl(LIB_SRC));
+    pdfjs.GlobalWorkerOptions.workerSrc = blobUrl(WORKER_SRC);
+    send({ type: 'ready' });
+  }
+
+  function cssScale(baseWidth) {
+    return (window.innerWidth - 16) / baseWidth;
+  }
+
+  function sizePage(p, base) {
+    const scale = cssScale(base.width);
+    p.scale = scale;
+    p.width = Math.floor(base.width * scale);
+    p.height = Math.floor(base.height * scale);
+    p.div.style.width = p.width + 'px';
+    p.div.style.height = p.height + 'px';
+    p.div.style.setProperty('--scale-factor', String(scale));
+  }
+
+  async function load(base64) {
+    const t0 = performance.now();
+    const res = await fetch('data:application/pdf;base64,' + base64);
+    const data = new Uint8Array(await res.arrayBuffer());
+    const t1 = performance.now();
+
+    if (drawObserver) drawObserver.disconnect();
+    if (clearObserver) clearObserver.disconnect();
+    if (doc) await doc.destroy();
+    pagesDiv.replaceChildren();
+    queue.length = 0;
+
+    doc = await pdfjs.getDocument({ data }).promise;
+    const t2 = performance.now();
+
+    // Placeholders sized like page 1 until each page's real size is known.
+    const first = (await doc.getPage(1)).getViewport({ scale: 1 });
+    pages = [];
+    for (let n = 1; n <= doc.numPages; n++) {
+      const div = document.createElement('div');
+      div.className = 'page';
+      div.dataset.page = String(n);
+      const p = { n, div, state: 'empty', task: null, textLayer: null, sized: n === 1 };
+      sizePage(p, first);
+      pages.push(p);
+      pagesDiv.appendChild(div);
+    }
+
+    // Sent once placeholders exist, so GOTO/PAGE messages that follow can find the pages.
+    send({ type: 'loaded', numPages: doc.numPages, decodeMs: Math.round(t1 - t0), openMs: Math.round(t2 - t1) });
+    drawObserver = new IntersectionObserver(onDrawIntersect, { rootMargin: DRAW_MARGIN });
+    clearObserver = new IntersectionObserver(onClearIntersect, { rootMargin: CLEAR_MARGIN });
+    for (const p of pages) {
+      drawObserver.observe(p.div);
+      clearObserver.observe(p.div);
+    }
+    fixPageSizes();
+  }
+
+  // Fetch every page's real size in the background, keeping the reading position steady.
+  async function fixPageSizes() {
+    const current = doc;
+    for (const p of pages) {
+      if (doc !== current) return;
+      if (p.sized) continue;
+      const base = (await doc.getPage(p.n)).getViewport({ scale: 1 });
+      const oldHeight = p.height;
+      sizePage(p, base);
+      p.sized = true;
+      const delta = p.height - oldHeight;
+      // A page above the screen changed height: scroll by the same amount so the view doesn't jump.
+      if (delta && p.div.getBoundingClientRect().bottom < 0) window.scrollBy(0, delta);
+    }
+  }
+
+  function onDrawIntersect(entries) {
+    for (const e of entries) {
+      const p = pages[Number(e.target.dataset.page) - 1];
+      if (e.isIntersecting && p.state === 'empty') {
+        p.state = 'queued';
+        queue.push(p);
+      }
+    }
+    // Draw the pages closest to the screen first.
+    const mid = window.scrollY + window.innerHeight / 2;
+    queue.sort((a, b) => Math.abs(a.div.offsetTop - mid) - Math.abs(b.div.offsetTop - mid));
+    pump();
+  }
+
+  function onClearIntersect(entries) {
+    for (const e of entries) {
+      if (!e.isIntersecting) clearPage(pages[Number(e.target.dataset.page) - 1]);
+    }
+  }
+
+  function clearPage(p) {
+    if (p.state === 'empty') return;
+    if (p.state === 'queued') queue.splice(queue.indexOf(p), 1);
+    if (p.task) p.task.cancel();
+    if (p.textLayer) p.textLayer.cancel();
+    p.task = p.textLayer = null;
+    p.div.replaceChildren();
+    p.state = 'empty';
+  }
+
+  function pump() {
+    while (active < MAX_CONCURRENT_RENDERS && queue.length) {
+      const p = queue.shift();
+      active++;
+      drawPage(p)
+        .catch((err) => {
+          // Cancelled because the page was cleared while drawing.
+          const cancelled = err && (err.name === 'RenderingCancelledException' || err.name === 'AbortException');
+          if (!cancelled) sendError(err);
+        })
+        .finally(() => {
+          active--;
+          pump();
+        });
+    }
+  }
+
+  async function drawPage(p) {
+    p.state = 'drawing';
+    const t0 = performance.now();
+    const page = await doc.getPage(p.n);
+    if (!p.sized) {
+      sizePage(p, page.getViewport({ scale: 1 }));
+      p.sized = true;
+    }
+    const viewport = page.getViewport({ scale: p.scale });
+    const q = quality(p);
+    const canvas = makeCanvas(p, q);
+    p.quality = q;
+    const textDiv = document.createElement('div');
+    textDiv.className = 'textLayer';
+
+    p.task = page.render({
+      canvasContext: canvas.getContext('2d'),
+      viewport,
+      transform: q !== 1 ? [q, 0, 0, q, 0, 0] : undefined,
+    });
+    await p.task.promise;
+    if (p.state !== 'drawing') return; // cleared while drawing
+    const marksDiv = document.createElement('div');
+    marksDiv.className = 'marks';
+    p.div.replaceChildren(canvas, marksDiv, textDiv);
+    renderMarks(p);
+    const t1 = performance.now();
+
+    const textContent = await page.getTextContent();
+    p.textLayer = new pdfjs.TextLayer({ textContentSource: textContent, container: textDiv, viewport });
+    await p.textLayer.render();
+    if (p.state !== 'drawing') return; // cleared while building the text layer
+    const t2 = performance.now();
+    p.task = null;
+    p.state = 'drawn';
+    send({
+      type: 'rendered',
+      page: p.n,
+      renderMs: Math.round(t1 - t0),
+      textMs: Math.round(t2 - t1),
+      textItems: textContent.items.length,
+    });
+  }
+
+  // Redraw a drawn page's canvas at a new quality, swapping it in when done (the text layer
+  // and marks are sized in CSS pixels and don't change).
+  async function redrawCanvas(p) {
+    const q = quality(p);
+    if (p.redrawing || Math.abs(q - (p.quality || 0)) < 0.25) return;
+    p.redrawing = true;
+    try {
+      const page = await doc.getPage(p.n);
+      const viewport = page.getViewport({ scale: p.scale });
+      const canvas = makeCanvas(p, q);
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport, transform: [q, 0, 0, q, 0, 0] }).promise;
+      const old = p.div.querySelector('canvas');
+      if (p.state === 'drawn' && old) {
+        old.replaceWith(canvas);
+        p.quality = q;
+      }
+    } finally {
+      p.redrawing = false;
+    }
+  }
+
+  let zoomTimer = null;
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', () => {
+      clearTimeout(zoomTimer);
+      zoomTimer = setTimeout(() => {
+        zoom = window.visualViewport.scale || 1;
+        // Pages on or near the screen, nearest first.
+        const near = pages
+          .filter((p) => p.state === 'drawn')
+          .map((p) => ({ p, r: p.div.getBoundingClientRect() }))
+          .filter(({ r }) => r.bottom > -window.innerHeight && r.top < 2 * window.innerHeight)
+          .map(({ p }) => p);
+        (async () => {
+          for (const p of near) await redrawCanvas(p).catch(sendError);
+        })();
+      }, 300);
+    });
+  }
+
+  function renderMarks(p) {
+    const layer = p.div.querySelector('.marks');
+    if (!layer) return;
+    layer.replaceChildren();
+    for (const m of marks) {
+      for (const r of m.rects) {
+        if (r.page !== p.n) continue;
+        const el = document.createElement('div');
+        el.className = 'mark ' + m.kind;
+        el.style.left = r.x * 100 + '%';
+        el.style.top = r.y * 100 + '%';
+        el.style.width = r.w * 100 + '%';
+        el.style.height = r.h * 100 + '%';
+        layer.appendChild(el);
+      }
+    }
+  }
+
+  // A tap (not a selection) on a drawn mark: tell React Native which one. Later marks win.
+  document.addEventListener('click', (e) => {
+    if (String(window.getSelection() || '').trim()) return;
+    const pageDiv = e.target.closest && e.target.closest('.page');
+    if (!pageDiv) return;
+    const n = Number(pageDiv.dataset.page);
+    const box = pageDiv.getBoundingClientRect();
+    const x = (e.clientX - box.left) / box.width;
+    const y = (e.clientY - box.top) / box.height;
+    for (let i = marks.length - 1; i >= 0; i--) {
+      const hit = marks[i].rects.some((r) => r.page === n && x >= r.x && x <= r.x + r.w && y >= r.y - 0.005 && y <= r.y + r.h + 0.005);
+      if (hit) {
+        send({ type: 'markTap', id: marks[i].id });
+        return;
+      }
+    }
+  });
+
+  function goTo(n) {
+    if (!pages.length) return;
+    const p = pages[Math.max(1, Math.min(pages.length, n)) - 1];
+    window.scrollTo(0, p.div.offsetTop);
+  }
+
+  // Scroll so that `offset` (0–1) of page n is above the top of the screen: the inverse of the position report.
+  function goToPosition(n, offset) {
+    if (!pages.length) return;
+    const p = pages[Math.max(1, Math.min(pages.length, n)) - 1];
+    window.scrollTo(0, p.div.offsetTop + Math.max(0, Math.min(1, offset)) * p.height);
+  }
+
+  // Report the page at the top of the screen and how far down it we are.
+  let lastPosition = '';
+  let posTimer = null;
+  window.addEventListener('scroll', () => {
+    clearTimeout(posTimer);
+    posTimer = setTimeout(() => {
+      if (!pages.length) return;
+      const y = window.scrollY;
+      let p = pages[0];
+      for (const q of pages) {
+        if (q.div.offsetTop <= y) p = q;
+        else break;
+      }
+      const offset = Math.max(0, Math.min(1, (window.scrollY - p.div.offsetTop) / p.height));
+      const key = p.n + ':' + offset.toFixed(2);
+      if (key !== lastPosition) {
+        lastPosition = key;
+        send({ type: 'position', page: p.n, offset: +offset.toFixed(3) });
+      }
+    }, 200);
+  });
+
+  // Selection: report text and rectangles as fractions of the page each one is on.
+  function selectionRects(range) {
+    const out = [];
+    const drawn = pages.filter((p) => p.state !== 'empty').map((p) => ({ p, box: p.div.getBoundingClientRect() }));
+    for (const r of range.getClientRects()) {
+      if (r.width < 1 || r.height < 1) continue;
+      const cy = r.top + r.height / 2;
+      const hit = drawn.find(({ box }) => cy >= box.top && cy <= box.bottom);
+      if (!hit) continue;
+      const { p, box } = hit;
+      out.push({
+        page: p.n,
+        x: +((r.left - box.left) / box.width).toFixed(4),
+        y: +((r.top - box.top) / box.height).toFixed(4),
+        w: +(r.width / box.width).toFixed(4),
+        h: +(r.height / box.height).toFixed(4),
+      });
+    }
+    return mergeRects(out);
+  }
+
+  // Text-layer spans give one rectangle per span, often overlapping. Merge rectangles on
+  // the same line of the same page into one, so a highlight is one even band per line.
+  function mergeRects(rects) {
+    // Group into lines: same page, vertical centres within half a line height.
+    const byCentre = rects.slice().sort((a, b) => a.page - b.page || a.y + a.h / 2 - (b.y + b.h / 2));
+    const lines = [];
+    for (const r of byCentre) {
+      const line = lines[lines.length - 1];
+      const ref = line && line[0];
+      if (ref && ref.page === r.page && Math.abs(ref.y + ref.h / 2 - (r.y + r.h / 2)) < Math.min(ref.h, r.h) / 2) line.push(r);
+      else lines.push([r]);
+    }
+    // Within a line, left to right: merge rectangles that overlap or nearly touch.
+    const out = [];
+    for (const line of lines) {
+      line.sort((a, b) => a.x - b.x);
+      let cur = null;
+      for (const r of line) {
+        if (cur && r.x <= cur.x + cur.w + 0.02) {
+          const x2 = Math.max(cur.x + cur.w, r.x + r.w);
+          const y1 = Math.min(cur.y, r.y);
+          const y2 = Math.max(cur.y + cur.h, r.y + r.h);
+          Object.assign(cur, { w: x2 - cur.x, y: y1, h: y2 - y1 });
+        } else {
+          cur = { ...r };
+          out.push(cur);
+        }
+      }
+    }
+    const round = (v) => +v.toFixed(4);
+    return out.map((r) => ({ page: r.page, x: round(r.x), y: round(r.y), w: round(r.w), h: round(r.h) }));
+  }
+
+  let selTimer = null;
+  document.addEventListener('selectionchange', () => {
+    clearTimeout(selTimer);
+    selTimer = setTimeout(() => {
+      const sel = window.getSelection();
+      const text = String(sel || '').trim();
+      if (!text || !sel.rangeCount) return;
+      const rects = selectionRects(sel.getRangeAt(0));
+      if (!rects.length) return;
+      const pageNums = rects.map((r) => r.page);
+      send({
+        type: 'selection',
+        text,
+        pageStart: Math.min(...pageNums),
+        pageEnd: Math.max(...pageNums),
+        rects,
+      });
+    }, 150);
+  });
+
+  // Plain text of pages from..to (clamped to the document), for the AI requests.
+  async function pageTexts(from, to) {
+    if (!doc) return [];
+    const out = [];
+    for (let n = Math.max(1, from); n <= Math.min(to, doc.numPages); n++) {
+      const content = await (await doc.getPage(n)).getTextContent();
+      const text = content.items.map((it) => (it.str || '') + (it.hasEOL ? '\n' : ' ')).join('');
+      out.push({ page: n, text: text.replace(/[ \t]+/g, ' ').replace(/ ?\n ?/g, '\n').trim() });
+    }
+    return out;
+  }
+
+  document.addEventListener('message', (e) => {
+    const data = String(e.data);
+    if (data.startsWith('LOAD:')) {
+      send({ type: 'received', at: Date.now(), chars: data.length - 5 });
+      load(data.slice(5)).catch(sendError);
+    } else if (data.startsWith('PAGE:')) {
+      goTo(parseInt(data.slice(5), 10));
+    } else if (data.startsWith('GOTO:')) {
+      const [n, offset] = data.slice(5).split(':');
+      goToPosition(parseInt(n, 10), parseFloat(offset) || 0);
+    } else if (data.startsWith('MARKS:')) {
+      marks = JSON.parse(data.slice(6));
+      for (const p of pages) if (p.state === 'drawn' || p.state === 'drawing') renderMarks(p);
+    } else if (data.startsWith('TEXT:')) {
+      const [id, from, to] = data.slice(5).split(':').map((x) => parseInt(x, 10));
+      pageTexts(from, to)
+        .then((texts) => send({ type: 'text', id, pages: texts }))
+        .catch((err) => send({ type: 'text', id, pages: [], error: String(err) }));
+    } else if (data === 'CLEARSEL') {
+      window.getSelection().removeAllRanges();
+    }
+  });
+
+  init().catch((err) => send({ type: 'error', message: 'init: ' + String((err && err.stack) || err) }));
+})();
+</script>
+</body>
+</html>

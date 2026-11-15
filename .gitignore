@@ -41,3 +41,8 @@ example
 # generated native folders
 /ios
 /android
+skills/*-workspace/
+
+# editor and Claude Code settings
+.vscode/
+.claude/

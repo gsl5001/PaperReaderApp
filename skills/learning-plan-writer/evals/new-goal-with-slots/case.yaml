@@ -1,0 +1,8 @@
+schema_version: "1.1"
+name: new-goal-with-slots
+expected_outcome: |
+  A single plan/v1 file that the parser accepts, with focus and listen slots
+  matching the request, start 2026-11-16, about 4 sections, Focus minutes per
+  section close to 3 x 45 minutes, open-access GP readings with direct PDF
+  URLs and verified page ranges, Listen items with NotebookLM sources, and
+  3-5 questions per section.

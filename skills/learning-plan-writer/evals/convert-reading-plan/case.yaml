@@ -1,0 +1,11 @@
+schema_version: "1.1"
+name: convert-reading-plan
+context:
+  scaffold_script: place-files.sh
+expected_outcome: |
+  A single plan/v1 file that the Learning Planner parser accepts. It keeps the
+  user's 9 weeks plus the optional extension, their readings and exercises, with
+  no slots in the frontmatter. Optional items are marked [optional], open-access
+  documents have direct pinned PDF URLs and real PDF page ranges, and each
+  section has 3-5 questions with answers and concepts. The response lists what
+  could not be carried over (intro, notation table).
